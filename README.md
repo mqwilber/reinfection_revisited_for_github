@@ -1,5 +1,5 @@
 README describes the code and data used for the manuscript "Prior infection by amphibian chytrid fungus reduces host susceptibility in the lab, but does
-not promote population recovery in field trials". 
+not promote population recovery in field trials". The `environment.yml` file will help build a conda environment to set up Stan and provide some of the key R packages.  Otherwise, a user can load the R packages as needed.
 
 - `code/`
 	- `field_analyses/`
