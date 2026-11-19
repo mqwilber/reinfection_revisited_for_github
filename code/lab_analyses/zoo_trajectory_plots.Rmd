@@ -1,0 +1,241 @@
+---
+title: "Plot the pre-release exposure trajectories for each site"
+output: html_document
+date: "2026-09-15"
+---
+
+# Plot the zoo trajectories from Site A (22008), Site B (20135), Site C (50785), and Site D (84235)
+
+This Rmarkdown plots the infection trajectories for individual frogs exposed in the zoos prior to release in the wild.
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(lubridate)
+```
+
+# Load Site A and Site B frogs
+
+```{r}
+tdat = fread("../../data/lab_data/zoo_exposures_22008_20135_releases.csv")
+
+# Set-up data for plotting
+tdat = tdat[, c("time_step"):=as.integer(Date - Date[1]), by=.(Individual_ID)]
+tdat$year = year(tdat$Date)
+
+# Relabel sites
+tdat$site_id = "Site A"
+tdat$treatment = ifelse(tdat$treatment_label_1 == "Control", 'unexposed', 'exposed')
+
+```
+
+Tyndall frogs went to both Site A and Site B.  Let's identify these via pit tags
+
+```{r}
+t_frogs = fread("../../data/field_data/22008/reintroductions_22008_mrmr.csv")
+t_pit = t_frogs$pit_tag_id
+
+r_frogs = fread("../../data/field_data/20135/reintroductions_20135_mrmr.csv")
+r_pit = r_frogs$pit_tag_id
+
+# Label Tyndall and Ranger Frogs
+tdat$site_id[tdat$Pit_Tag %in% t_pit] = "Site A"
+tdat$site_id[tdat$Pit_Tag %in% r_pit] = "Site B"
+
+# Specify approximate antifungal date
+afd1 = mdy("05/27/2016")
+
+# Loop through individuals and append if necessary
+unq_ids = tdat$Individual_ID
+all_ids = list()
+count = 1
+for(tid in unq_ids){
+  uid_dat = tdat[Individual_ID == tid][, .(Individual_ID, ZE_calculated, year, Date, treatment, site_id, Pit_Tag)][order(Date)]
+  
+  # Set the zeros pre-exposure
+  if(uid_dat$Date[1] == ymd("2016-05-12") | uid_dat$Date[1] == ymd("2016-05-11")){
+    new_dat = uid_dat[1, ]
+    new_dat$Date = new_dat$Date - 8
+    new_dat$ZE_calculated = 0
+    uid_dat = rbind(new_dat, uid_dat)
+  }
+  
+  if(uid_dat$Date[1] == ymd("2017-02-27")){
+    new_dat = uid_dat[1, ]
+    new_dat$Date = new_dat$Date - 8
+    new_dat$ZE_calculated = 0
+    uid_dat = rbind(new_dat, uid_dat)
+  }
+  
+  # Remove post-antifungal data
+  if(uid_dat$year[1] == 2016){
+    #uid_dat = uid_dat[Date < mdy("05/27/2016")]
+    uid_dat$af_date = mdy("05/23/2016")
+    uid_dat = uid_dat[year == 2016]
+  }
+
+  if(any(uid_dat$Date %in% ymd("2017-02-27"))){
+    #uid_dat = uid_dat[Date <= mdy("03/20/2017")]
+    uid_dat$af_date = mdy("03/20/2017")
+  }
+
+  if(any(uid_dat$Date %in% mdy("05/11/2017")) | (any(uid_dat$Date %in% mdy("04/19/2017")))){
+    #uid_dat = uid_dat[Date <= mdy("05/11/2017")]
+    uid_dat$af_date = mdy("05/11/2017")
+  }
+  
+  all_ids[[count]] = uid_dat
+  count = count + 1
+
+}
+
+tdat_append = do.call(rbind, all_ids)
+tdat_append = tdat_append[, c("time_step"):=as.integer(Date - Date[1]), by=.(Individual_ID)]
+```
+
+
+```{r}
+sample_size_labs = tdat_append[Pit_Tag %in% c(t_pit, r_pit)][,
+                              .(count=length(unique(Individual_ID))), 
+                                by=.(treatment, year, site_id)][
+                                order(site_id, year, treatment)]
+sample_size_labs$count_lab = paste0("n = ", sample_size_labs$count)
+
+pab = ggplot(tdat_append[Pit_Tag %in% c(t_pit, r_pit)], aes(x=Date, y=log10(ZE_calculated + 1))) + 
+            geom_line(aes(group=Individual_ID, color=Individual_ID)) + 
+            geom_point(size=0.5) +
+            geom_vline(aes(xintercept=af_date), linetype="dashed") +
+            geom_text(data = sample_size_labs,
+                      aes(x = -Inf, y = Inf, label = count_lab),
+                      inherit.aes = FALSE,
+                      hjust = -0.1, vjust = 1.5, size = 3) +
+            facet_grid(site_id~treatment + year, scales="free_x") + 
+            theme_classic() + theme(legend.position = "none", 
+                                    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+            ylab("log10(Bd load + 1)") + xlab("Date")
+
+pab
+```
+
+```{r}
+tdat_append[Pit_Tag %in% c(t_pit, r_pit)][, .(count=length(unique(Individual_ID))), by=.(treatment, year, site_id)][order(site_id, year, treatment)]
+```
+
+# Make plots for Site C
+
+```{r}
+sitec_dat = fread("../../data/lab_data/zoo_exposures_50785_releases.csv")
+sitec_pit = fread("../../data/field_data/50785/reintroductions_50785_mrmr.csv")$pit_tag_id
+sitec_dat$year = year(sitec_dat$collect_date)
+sitec_dat$site_id = "Site C"
+sitec_dat$treatment = sitec_dat$bd_exposure
+
+sample_size_labs = sitec_dat[pit_tag_id %in% c(sitec_pit)][,
+                              .(count=length(unique(pit_tag_id))), 
+                                by=.(treatment, year, site_id)][
+                                order(site_id, year, treatment)]
+sample_size_labs$count_lab = paste0("n = ", sample_size_labs$count)
+
+
+pc = ggplot(sitec_dat[pit_tag_id %in% c(sitec_pit)], aes(x=collect_date, y=log10(bd_load + 1))) + 
+              geom_line(aes(group=as.factor(pit_tag_id), color=as.factor(pit_tag_id))) +
+              geom_point(size=0.5) +
+              geom_text(data = sample_size_labs,
+                      aes(x = -Inf, y = Inf, label = count_lab),
+                      inherit.aes = FALSE,
+                      hjust = -0.1, vjust = 1.5, size = 3) +
+              geom_vline(aes(xintercept=mdy("06/06/2019")), linetype="dashed") +
+              facet_grid(site_id~treatment + year, scales="free_x") +
+              theme_classic() + theme(legend.position = "none", 
+                                    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+              ylab("log10(Bd load + 1)") + xlab("Date")
+pc
+```
+# Make plots for Site D
+
+```{r}
+age_data = fread("../../data/lab_data/AGE_experiment_data.csv")
+release_metadata = as.data.table(read.csv("../../data/lab_data/zoo_exposures_84235_individual_ids.csv"))[, .(ID, Pit.Tag)]
+colnames(release_metadata) = c("ID", "pit_tag_id")
+
+age_data = merge(age_data, release_metadata, by="ID", all.x=TRUE)
+
+sited_frogs = fread("../../data/field_data/84235/reintroductions_84235_mrmr.csv")
+sited_pit = sited_frogs$pit_tag_id
+sited_pit
+
+age_data_trun = age_data[pit_tag_id %in% sited_pit]
+age_data_trun$date = mdy(age_data_trun$date)
+age_data_trun$year = year(age_data_trun$date)
+age_data_trun$treatment = ifelse(age_data_trun$treatment == 1, "exposed", "unexposed")
+age_data_trun$site_id = "Site D"
+age_data_trun$capture_state = ifelse(age_data_trun$wild_or_naive == "wild", "Collected as froglet", "Collected as egg")
+
+age_data_trun
+```
+
+Merge in the post-anti-fungal data
+
+```{r}
+post_af = fread("../../data/lab_data/AGE_experiment_post_treatment.csv")
+post_af
+post_af_melt = melt(post_af, id.vars = c("id", "pit_tag_id", "group", "treatment_type"), 
+                    value.name = 'ave_ZE', 
+                    variable.name = "date")
+post_af_melt
+colnames(post_af_melt) = c('ID', 'pit_tag_id', "wild_or_naive", "treatment", "date", "ave_ZE")
+post_af_melt$date = mdy(post_af_melt$date)
+post_af_melt = as.data.table(post_af_melt)
+post_af_melt = post_af_melt[pit_tag_id %in% sited_pit]
+
+
+post_af_melt
+
+post_af_melt$wild_or_naive[post_af_melt$wild_or_naive != "wild"] = "naive"
+post_af_melt$treatment = ifelse(post_af_melt$treatment == "treatment", "exposed", "unexposed")
+
+age_data_trun = rbind(age_data_trun[, .(ID, pit_tag_id, wild_or_naive, treatment, date, ave_ZE)], post_af_melt)[order(ID, date)]
+
+age_data_trun$capture_state = ifelse(age_data_trun$wild_or_naive == "wild", "Collected as froglet", "Collected as egg")
+
+age_data_trun$site_id = "Site D"
+age_data_trun$year = year(age_data_trun$date)
+```
+
+
+```{r}
+sample_size_labs = age_data_trun[,
+                              .(count=length(unique(pit_tag_id))), 
+                                by=.(treatment, year, site_id)][
+                                order(site_id, year, treatment)]
+sample_size_labs$count_lab = paste0("n = ", sample_size_labs$count)
+
+pd = ggplot(age_data_trun, aes(x=date, y=log10(ave_ZE + 1))) + 
+            geom_line(aes(group=as.factor(pit_tag_id), color=as.factor(pit_tag_id), linetype=capture_state)) +
+            geom_point(size=0.5) +
+            geom_text(data = sample_size_labs,
+                      aes(x = -Inf, y = Inf, label = count_lab),
+                      inherit.aes = FALSE,
+                      hjust = -0.1, vjust = 1.5, size = 3) +
+            geom_vline(aes(xintercept=mdy("04/28/2015")), linetype="dashed") +
+            facet_grid(site_id~treatment + year, scales="free_x") +
+            guides(color="none") +
+            theme_classic() + theme(legend.position = c(0.8, 0.7), 
+                                    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+            ylab("log10(Bd load + 1)") + xlab("Date")
+pd
+```
+
+```{r}
+library(patchwork)
+
+# Define custom layout string
+layout <- "
+  AAAA
+  BBCC
+"
+
+# Combine using the design
+(pab + pc + pd) + plot_layout(design = layout)
+ggsave("../../results/zoo_exposure_trajectories.pdf", width=12, height=10)
+```

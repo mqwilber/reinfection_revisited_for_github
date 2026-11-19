@@ -1,0 +1,93 @@
+README describes the code and data used for the manuscript "Prior infection by amphibian chytrid fungus reduces host susceptibility in the lab, but does
+not promote population recovery in field trials". 
+
+- `code/`
+	- `field_analyses/`
+		- `cmr_analyses/`
+			- `CMR_analysis_field.Rmd`: R markdown file contains the code to replicate the CMR analyses for each of the four field sites described in the main text.  Figure 4 and Figure 5 can be replicated by this script.
+			- `ipm_simulation.R`: Auxillary functions used for formatting data and simulating models.  
+			- `stanfiles/`
+				- `cmr_field_exposure.stan`: Stan model used to fit the CMR data from Sites A, B, and D.
+				- `cmr_field_exposure_fixedloss.stan`: Stan model used to fit the CMR data from Site C. 
+	- `lab_analyses`
+		- `reinfection_analysis.Rmd`: R markdown file that replicates the analysis of the REINF and AGE laboratory experiments.  Figure 2 and Figure 3 can be replicated with this script.
+		- `zoo_trajectory_plots.Rmd`: R markdown file replicates Figure S1 in the Appendix.
+		- `stan_models/`
+			- `age_ipm_model.stan`: Stan model for fitting the AGE laboratory experiment.
+			- `reinf_ipm_model.stan`: Stan model for fitting the REINF laboratory experiment.
+
+- `data/`
+	- `field_data/`
+		- `20135/`, `22008/`, `50785/`, `84235/`: Folders that contain relevant CMR data for each site
+			- `captures_*.csv`: Contains data regarding the captures of individual frogs. Below we given the meaning of the column names for these data files.
+				- `site_id`: The numeric site id where a frog was captured. Note, there might be more than one site id as frogs could move between nearby sites (i.e., nearby lakes).
+				- `visit_date`: The visit date when the frog was captured.
+				- `survey_type`: Indicates that the capture happened during a cmr event.
+				- `pit_tag_id`: The pit tag id for the captured frog
+				- `tag_new`: Whether or not a new tag was added
+				- `swab_id`: The ID of the Bd swab
+				- `bd_load`: The observed Bd load on the swab in zoospore equivalents.
+			- `surveys_*_mrmr.csv`: The date of primary and secondary periods following a robust CMR design.
+				- `survey_date`: The date of the visit
+				- `primary_period`: The primary period that the visit date is associated with.
+				- `secondary_period`: The secondary period that the visit date is associated with.
+			- `reintroductions_*_mrmr.csv`: Pit tag and treatment information for each frog.
+				- `pit_tag_id`: The pit tag of a frog
+				- `release_date`: The date the frog was released into a site
+				- `release_location`: The site id where that frog was released
+				- `treatment`: Whether that individual was in the "exposed" or "unexposed" treatment group.
+	- `lab_data/`
+		- `AGE_experiment_data.csv`: Data from the AGE experiment
+			- `swab_id`: The id of the Bd swab
+			- `date`: The date the swab was taken
+			- `frog`: The unique frog ID
+			- `day`: The day of the experiment where exposure happens at day 0.
+			- `ID`: Another unique frog ID
+			- `ave_ZE`: Average zoospore equivalents on a swab
+			- `wild_or_naive`: Whether an individual was naive or wild caught.
+			- `W1_ITCZ`: 1 if there was an itraconozole treatment following the week 1 swab. 0 otherwise.
+			- `W3_ITCZ`: 1 if there was an itraconozole treatment following the week 3 swab. 0 otherwise.
+			- `control`: 1 if the frog was a control individual, 0 otherwise.
+			- `treatment`: 1 if the frog was a control frog, 0 otherwise.
+			- `sex`: Male (M) or female (F)
+			- `beg_wt`: Beginning weight in g
+			- `beg_svl`: Beginning length in mm.
+			- `tank`: Tank identifier
+			- `tub`: Tub identifier
+		- `AGE_experiment_post_treatment.csv`: A map between individuals in the AGE experiment and individuals released into Site D.
+			- `id`: Frog ID. Maps to column "ID" in `AGE_experiment_data.csv`
+			- `pit_tag_id`: The pit tag of the frog that was eventually released into Site D.
+			- `group`: Whether frogs were from the "wild" or "naive" group
+			- `treatment_type`: Whether frogs were "control" or "treatment", where "treatment" corresponds to exposed.
+			- `5/10/15`: Post-treatment swab date
+			- `5/12/15`: Post-treatment swab date
+		- `REINF_experiment_data.csv`: Data from REINF experiment
+			- `swabid`: Unique swab_id
+			- `frog`: Unique frog id
+			- `days`: Days relative to the reinfection where 0 is the start of the reinfection experiment.
+			- `date_collected`: The date when a swab was collected
+			- `ZE`: The zoospore equivalents on a swab
+			- `ttt`: The treatment label. 
+				- N = Naive frogs with no previous exposure
+				- A = Frogs that were exposed 30 days prior
+				- B = Frogs that were exposed 6 months prior
+		- `zoo_exposures_22008_20135_releases.csv`: Zoo exposure data for frogs from 22008 and 20135 prior to release
+			- `Individual_ID`: The individual ID of the frog.
+			- `Pit_Tag`: The pit tag of the frog.  Maps to the frogs released in 22008 and 20135.
+			- `Sex`: The sex of the frog, (M)ale and (F)emale
+			- `Date`: The date of the bd swab
+			- `treatment_label_1`:
+				- "Exposure": Frog was exposed and then cleared of Bd
+				- "Control": Frog was not exposed to Bd
+			- `ZE_calculated`: The zoospore equivalents measured on the swab.
+		- `zoo_exposures_50785_releases.csv`: Zoo exposure data for frogs from 50785 prior to release.
+			- `pit_tag_id`: The pit tag of the frogs. Maps to pit tags for frogs released in site 50785.
+			- `bd_exposure`: 
+				- 'exposed': Indicates a frog was exposed to Bd and cleared of infection prior to release
+				- 'unexposed': Indicates a frog was not exposed to Bd prior to release.
+			- `collect_date`: The date that the swabs were collected
+			- `bd_load`: The zoospore equivalents on the swabs
+		- `zoo_exposures_84235_individual_ids.csv`: Data file linking pit tags and zoo IDs for individuals released into 84235.
+			- `ID`: Laboratory ID
+			- `Pit Tag`: Pit tag id used in the field
+			- `sex`: Male or Female

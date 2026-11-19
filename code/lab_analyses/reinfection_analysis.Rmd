@@ -1,0 +1,754 @@
+---
+title: "Formatting and fitting reinfection lab data for REINF and AGE experiments"
+output: html_notebook
+author: Mark Wilber
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(rstan)
+library(reshape2)
+```
+
+# REINF Experiment
+
+## Step 1: Formatting data for IPM analysis
+
+Load in the data
+
+```{r}
+dat = fread("../../data/lab_data/REINF_experiment_data.csv")
+```
+
+Plot the experimental data
+
+```{r}
+# Drop preliminary days
+pdat = as.data.table(dat)[days >= -17, ]
+pdat[days == -17, "days"] = 0
+pdat$treatment = plyr::revalue(pdat$ttt, c("A"="30 days prior", "B"="6 months prior", "N"="Naive"))
+
+pdat_medians = pdat[, list(median_load=median(ZE)), by=list(treatment, days)]
+ggplot(pdat, aes(x=days, y=log(ZE + 1), color=treatment)) + geom_line(aes(group=as.factor(frog)), alpha=0.3) + 
+                geom_line(data=pdat_medians, aes(y=log(median_load + 1), x=days, color=treatment), linewidth=1) + 
+                theme_bw() + ylab("ln(Bd load + 1)") + xlab("Days") + guides(color=guide_legend(title="Treatment"))
+
+```
+
+Format the data for the Stan analysis. Drop all preliminary time points before day == -17 as these were just
+swabs checking on individuals.
+
+```{r}
+# Split up the data by treatment
+trun_dat = dat[dat$days >= - 17, ]
+plot_dat = trun_dat
+plot_dat[plot_dat$days == -17, "days"] = 0
+treatments = lapply(unique(trun_dat$ttt), function(x) trun_dat[trun_dat$ttt == x, ])
+
+max_days = 10 # Maximum number of days
+max_frogs= 20 # Maximum number of frogs
+
+# Lists to hold results
+days_arrays = list()
+load_arrays = list()
+
+for(j in 1:length(treatments)){
+    
+    tdat = treatments[[j]]
+    days = array(-1, dim=c(max_frogs, max_days))
+    loads = array(-1, dim=c(max_frogs, max_days))
+    
+    for(i in 1:length(unique(tdat$frog))){
+        
+        frog_id = unique(tdat$frog)[i]
+        temp = tdat[tdat$frog == frog_id, c("days", "ZE")]
+        temp$days[temp$days == -17] = 0 # Day -17 is really day 0 
+        
+        # Check if there are two zeros and drop one of the zeros
+        if(sum(temp$days == 0) > 1)
+            temp = temp[-1, ]
+        
+        # Exclude frog 10 with only 2 swabs post-infection
+        if(length(temp$days) > 3){
+            days[i, 1:length(temp$days)] = temp$days
+            loads[i, 1:length(temp$days)] = temp$ZE
+        } else{
+          print(frog_id)
+        }
+    }
+    
+    days_arrays[[j]] = days
+    load_arrays[[j]] = loads
+}
+        
+```
+
+**How many different types of transitions are in this data?**
+
+The treatment groups are represented by the heading "ttt", where
+N=naive, A=recently infected (30 days prior) and B = distantly infected
+(6 months prior).
+
+```{r}
+trans_type = function(x, method){
+  
+  n = length(x)
+  x1 = x[1:(n - 1)]
+  x2 = x[2:n]
+  
+  if(method == "0tonot0")
+    return(sum((x1 == 0) & (x2 > 0)))
+  else if(method == "0to0")
+    return(sum((x1 == 0) & (x2 == 0)))
+  else if(method == "not0tonot0")
+    return(sum((x1 > 0) & (x2 > 0)))
+  else if(method == "not0to0")
+    return(sum((x1 > 0) & (x2 == 0)))
+  else
+    return(paste(method, "not recognized"))
+    
+}
+
+transitions = c("0tonot0", "0to0", "not0tonot0", "not0to0")
+
+res = list()
+treat_names = unique(trun_dat$ttt)
+
+for(trans in transitions){
+  
+  res[[trans]] = array(NA, dim=3)
+  names(res[[trans]]) = treat_names
+  
+  for(j in 1:length(load_arrays)){
+    
+    tload = load_arrays[[j]]
+    res[[trans]][j] = sum(apply(tload, 1, trans_type, trans))
+  }
+}
+
+res
+```
+
+```{r}
+
+# Number of data points contributing to likelihood
+counter = 0
+
+for(t in 1:length(load_arrays)){ # Loop over treatments
+  treatment = load_arrays[[t]]
+  
+  for(f in 1:nrow(treatment)){ # Loop over frogs
+    
+    for(time in 1:ncol(treatment)){ # Loop over time steps
+      
+      if(time != 10){ # Last time step
+        if(treatment[f, time] != -1 & treatment[f, time + 1] != -1){
+          counter = counter + 1
+        }
+      }
+    }
+  }
+}
+
+
+```
+
+
+## Step 2: Fit the IPM model as described in the Appendix
+
+
+```{r}
+# Fitting the stan model
+stan_data = list("T"=3, "H"= max_frogs, "time_steps"=max_days, samps=load_arrays, D=counter, days=days_arrays)
+```
+
+
+```{r}
+ipm_mod = stan("stan_models/reinf_ipm_model.stan", data=stan_data, 
+                        warmup=1000, iter=5000, chains=3, cores=3)
+```
+
+Check model convergence
+
+```{r}
+# Check Summary
+summary_matrix = summary(ipm_mod)$summary
+summary_matrix[1:18, ]
+```
+
+```{r}
+traceplot(ipm_mod, pars=row.names(summary_matrix)[1:18])
+```
+
+###  The initial transmission function
+
+```{r}
+colors = c('#1b9e77','#d95f02','#7570b3')
+
+
+quants = c(0.025, 0.5, 0.975)
+mod_prms = rstan::extract(ipm_mod)
+naive_prob = rethinking::inv_logit(mod_prms$bt_init0)
+treatA_prob = rethinking::inv_logit(mod_prms$bt_init0 + mod_prms$bt_tA)
+treatB_prob = rethinking::inv_logit(mod_prms$bt_init0 + mod_prms$bt_tB)
+trans_dat = melt(rbind(naive_prob, treatA_prob, treatB_prob))
+colnames(trans_dat) = c("Treatment", "index", "prob")
+
+# 1-month effect
+quantile(mod_prms$bt_tA, c(0.025, 0.975))
+
+# 6-month effect
+quantile(mod_prms$bt_tB, c(0.025, 0.975))
+
+
+trans_dat$Treatment = plyr::revalue(trans_dat$Treatment, c(naive_prob = "REINF-N", treatA_prob = "REINF-1mo", treatB_prob="REINF-6mo"))
+trans_dat$Treatment = factor(trans_dat$Treatment, levels=c("REINF-N", "REINF-1mo", "REINF-6mo"))
+
+pinf_plot = ggplot(data=trans_dat, aes(x=Treatment, y=prob, fill=Treatment)) + geom_violin(alpha=0.8) + 
+            xlab("") + ylab("Probability of infection\nupon re-exposure") + 
+            theme_classic() + stat_summary(fun.y=median, geom="point", size=2, color="black") + ylim(0, 1) + scale_fill_manual(values = colors)
+pinf_plot
+ggsave("../../results/initial_infection_probability_reinf.pdf", width=5, height=3)
+pinf_plot = pinf_plot + theme(legend.position = "none")
+pinf_plot
+as.data.table(trans_dat)[, list(median=quantile(prob, c(0.025, 0.5, 0.975))), by=c("Treatment")]
+```
+
+### The loss of infection function
+
+```{r}
+library(magrittr)
+zvals = seq(-1, 12, length=100)
+naive_loss = sapply(zvals, function(z) rethinking::inv_logit(mod_prms$bl0 + mod_prms$bl1*z)) %>% apply(2, quantile, quants) %>% t() %>% as.data.frame()
+treatA_loss = sapply(zvals, function(z) rethinking::inv_logit(mod_prms$bl0 + (mod_prms$bl1)*z + mod_prms$bl_tA)) %>% apply(2, quantile, quants) %>% t() %>% as.data.frame()
+treatB_loss = sapply(zvals, function(z) rethinking::inv_logit(mod_prms$bl0 + (mod_prms$bl1)*z + mod_prms$bl_tB)) %>% apply(2, quantile, quants) %>% t() %>% as.data.frame()
+
+naive_loss$treatment = "REINF-N"
+treatA_loss$treatment = "REINF-1mo"
+treatB_loss$treatment = "REINF-6mo"
+
+loss_dat = rbind(naive_loss, treatA_loss, treatB_loss)
+loss_dat$treatment = factor(loss_dat$treatment, levels=c("REINF-N", "REINF-1mo", "REINF-6mo"))
+
+loss_dat$lgzoo = log10(exp(rep(zvals, 3)))
+colnames(loss_dat) = c("lower", "median", "upper", "Treatment", "lgzoo")
+loss_plot = ggplot(loss_dat) + geom_line(aes(x=lgzoo, y=median, color=Treatment), size=1) + 
+        geom_ribbon(aes(x=lgzoo, ymax=upper, ymin=lower, fill=Treatment), 
+                    alpha=0.2, size=0) + scale_fill_manual(values = colors) +
+        theme_classic() + 
+        xlab(expression(log[10]*"(Bd intensity) at time "*italic(t))) + 
+        ylab("Probability of losing an infection\nby time t + 1")
+
+# Plot observed growth data on this plot as well
+loss_dat_reinf = pdat[, list(sizeZE=ZE[1:(length(ZE) - 1)], 
+                     sizeZENext=ZE[2:length(ZE)],
+                     ttt=unique(ttt)), by=c("frog")]
+
+loss_dat_reinf$ttt = plyr::revalue(loss_dat_reinf$ttt, c('N'="REINF-N", "B"="REINF-6mo", "A"="REINF-1mo"))
+loss_dat_reinf$ttt = factor(loss_dat_reinf$ttt, levels=c("REINF-N", "REINF-1mo", "REINF-6mo"))
+loss_plot = loss_plot + geom_point(data=loss_dat_reinf[sizeZE > 0, ], aes(x=log10(sizeZE), y=as.integer(sizeZENext == 0), color=ttt), size=2, pch=21) +
+            scale_color_manual(values =colors)
+loss_plot
+ggsave("../../results/loss_plot_reinf.pdf",width=5, height=3)
+loss_plot = loss_plot + theme(legend.position = "none")
+loss_plot
+```
+
+### Growth of infection
+
+```{r}
+
+zvals = seq(-1, 12, length=100)
+naive_loss = sapply(zvals, function(z) mod_prms$bg0 + z*(mod_prms$bg1)) %>% apply(2, quantile, quants) %>% t() %>% as.data.frame()
+treatA_loss = sapply(zvals, function(z) mod_prms$bg0 + z*(mod_prms$bg1 + mod_prms$bg_tA) + mod_prms$bg_tA2
+                     ) %>% apply(2, quantile, quants) %>% t() %>% as.data.frame()
+treatB_loss = sapply(zvals, function(z) mod_prms$bg0 + z*(mod_prms$bg1 + mod_prms$bg_tB) + mod_prms$bg_tB2
+                     ) %>% apply(2, quantile, quants) %>% t() %>% as.data.frame()
+
+quantile(mod_prms$bg_tB, c(0.025, 0.5, 0.975))
+
+naive_loss$treatment = "REINF-N"
+treatA_loss$treatment = "REINF-1mo"
+treatB_loss$treatment = "REINF-6mo"
+
+growth_dat = rbind(naive_loss, treatA_loss, treatB_loss)
+growth_dat$treatment = factor(growth_dat$treatment, levels=c("REINF-N", "REINF-1mo", "REINF-6mo"))
+growth_dat$lgzoo = log10(exp(rep(zvals, 3)))
+
+#Drop treatment A because there is no information to infer this
+colnames(growth_dat) = c("lower", "median", "upper", "Treatment", "lgzoo")
+growth_dat_trun = droplevels(growth_dat[growth_dat$Treatment != "REINF-1mo", ])
+
+growthplot = ggplot(data=growth_dat_trun) + geom_line(aes(x=lgzoo, y=log10(exp(median)), color=Treatment)) + 
+        geom_ribbon(aes(x=lgzoo, ymax=log10(exp(upper)), ymin=log10(exp(lower)), fill=Treatment), alpha=0.2, size=0) + 
+        scale_fill_manual(values = c('#1b9e77','#7570b3')) + 
+        theme_classic() + xlab(expression(log[10]*"(Bd intensity) at time "*italic(t))) +
+        ylab(expression(log[10]*"(Bd intensity) at time "*italic(t)*" + 1")) +
+        geom_line(data=as.data.frame(zvals), aes(x=log10(exp(zvals)), y=log10(exp(zvals))), color="black", linetype="dashed")
+
+# Plot observed growth data on this plot as well
+growth_dat_reinf = pdat[, list(sizeZE=ZE[1:(length(ZE) - 1)], 
+                     sizeZENext=ZE[2:length(ZE)],
+                     ttt=unique(ttt)), by=c("frog")]
+
+growth_dat_reinf$ttt = plyr::revalue(growth_dat_reinf$ttt, c('N'="REINF-N", "B"="REINF-6mo", "A"="REINF-1mo"))
+growth_dat_reinf$ttt = factor(growth_dat_reinf$ttt, levels=c("REINF-N", "REINF-1mo", "REINF-6mo"))
+
+growth_plot = growthplot + geom_point(data=droplevels(growth_dat_reinf[(sizeZE > 0 & sizeZENext > 0) & (ttt != "REINF-1mo"), ]), aes(x=log10(sizeZE), y=log10(sizeZENext), color=ttt), pch=21) + scale_color_manual(values = c('#1b9e77','#7570b3'))
+
+growth_plot
+ggsave("../../results/growth_plot_reinf.pdf", width=5, height=3)
+growth_plot = growth_plot + theme(legend.position = "none")
+growth_plot
+
+```
+
+### Get the statistics from the REINF model
+
+```{r}
+# 1. Loss effects
+rethinking::precis(ipm_mod, prob=0.95)
+```
+
+```{r}
+# 2. Stationary load
+params = rstan::extract(ipm_mod)
+treatB_stationary = (params$bg0 + params$bg_tB2) / (1 - (params$bg1 + params$bg_tB)) 
+naive_stationary = (params$bg0) / (1 - (params$bg1))
+quantile(log10(exp(naive_stationary)), c(0.025, .5, .975))
+quantile(log10(exp(treatB_stationary)), c(0.025, .5, .975))
+diff_btwn = log10(exp(treatB_stationary)) - log10(exp(naive_stationary))
+mean(diff_btwn)
+quantile(diff_btwn, c(.025, 0.975))
+```
+
+## Step 3: Project the best fit model forward for each treatment
+
+Now we want to project these best fit models forward in time to compare
+their fit to the observed data.
+
+```{r}
+
+ipm_sim_base = function(num, time_steps, params, treatment){
+  # Simulating an individual frog trajectory from the fitted model (based on model ipm_mod8D)
+  # 
+  # num : int, a simulation number
+  # time_steps : number of discrete time steps to simulate the model
+  # params: A vector of ipm parameters
+  # treatment: Either "naive", "A", or "B"
+  
+  times = 0:time_steps
+  init_load = 0
+  loads = array(NA, dim=length(times))
+  
+  # Set treatment coeffs
+  if(treatment == "naive"){
+    treat_coefs = c(0, 0)
+  } else if(treatment == "A"){
+    treat_coefs = c(1, 0)
+  } else{
+    treat_coefs = c(0, 1)
+  }
+  
+  loads[1] = init_load
+  
+  for(i in 2:(time_steps + 1)){
+    
+    current_load = loads[i - 1]
+    
+    # Transmission
+    if(current_load == 0){
+      
+      if(i == 2)
+        trans = rbinom(1, 1, rethinking::inv_logit(params['bt_init0'] + params['bt_tA']*treat_coefs[1] + params['bt_tB']*treat_coefs[2]))
+      else
+        trans = rbinom(1, 1, rethinking::inv_logit(params['bt0']))
+      
+      next_load = trans * exp(rnorm(1, mean=params['binit0'], sd=params['sigma_init']))
+      
+    } else if(current_load > 0){ # Loss of infection or growth
+      
+      loss = rbinom(1, 1, rethinking::inv_logit(params['bl0'] + params['bl1']*log(current_load) + params['bl_tA']*treat_coefs[1] + 
+                                          params['bl_tB']*treat_coefs[2]))
+      next_load = (1  - loss) * exp(rnorm(1, mean=params['bg0'] + log(current_load)*(params['bg1'] + 
+                                          params['bg_tB']*treat_coefs[1] + params['bg_tB']*treat_coefs[2]) + params['bg_tB2']*treat_coefs[1] + params['bg_tB2']*treat_coefs[2]
+                                          , sd=sqrt(params['sigma2_growth']*exp(2*params['delta']*log(current_load)))))
+      
+    }
+    
+    loads[i] = next_load
+    
+  }
+  
+  return(cbind(loads=loads, time=times, simid=rep(num, length(loads))))
+  
+}
+
+```
+
+**Naive individuals**
+
+```{r}
+all_params = as.data.frame(mod_prms[names(mod_prms)[1:18]])
+med_params = apply(all_params, 2, quantile, 0.5)
+
+traj = do.call(rbind, lapply(1:1000, function(i) ipm_sim_base(i, 9, med_params, "naive"))) %>% as.data.frame()
+traj_med = as.data.frame(as.data.table(traj)[, list(med_load=median(loads), 
+                                                    lower=quantile(loads, 0.025), 
+                                                    upper=quantile(loads, 0.975)), by=c("time")])
+
+# Naive
+naive_plt = ggplot() + 
+          geom_line(data=plot_dat[plot_dat$ttt == "N", ], aes(x=days, y=log10(ZE + 1), group=as.factor(frog), color='REINF-N'), alpha=0.5) +
+          geom_line(data=traj_med, aes(x=time*7, y=log10(med_load + 1), color='REINF-N'), size=2) +
+          theme_bw() + xlab("Time in days") + ylab(expression(log[10]*"(Bd intensity + 1)")) + ylim(0, 6)
+
+
+# REINF-1mo
+all_params = as.data.frame(mod_prms[names(mod_prms)[1:18]])
+med_params = apply(all_params, 2, quantile, 0.5)
+
+traj = do.call(rbind, lapply(1:1000, function(i) ipm_sim_base(i, 9, med_params, "A"))) %>% as.data.frame()
+traj_med = as.data.frame(as.data.table(traj)[, list(med_load=median(loads)), by=c("time")])
+
+naive_plt = naive_plt + geom_line(data=plot_dat[plot_dat$ttt == "A", ], aes(x=days, y=log10(ZE + 1), group=as.factor(frog), color="REINF-1mo"), alpha=0.5) + 
+          geom_line(data=traj_med, aes(x=time*7, y=log10(med_load + 1), color='REINF-1mo'), size=2) +
+          theme_bw()
+
+naive_plt
+
+
+# REINF-6mo
+all_params = as.data.frame(mod_prms[names(mod_prms)[1:18]])
+med_params = apply(all_params, 2, quantile, 0.5)
+
+traj = do.call(rbind, lapply(1:1000, function(i) ipm_sim_base(i, 9, med_params, "B"))) %>% as.data.frame()
+traj_med = as.data.frame(as.data.table(traj)[, list(med_load=median(loads)), by=c("time")])
+
+naive_plt = naive_plt + geom_line(data=plot_dat[plot_dat$ttt == "B", ], 
+                                  aes(x=days, y=log10(ZE + 1), 
+                                      group=as.factor(frog), 
+                                      color="REINF-6mo"), alpha=0.5) + 
+                        geom_line(data=traj_med, 
+                                  aes(x=time*7, y=log10(med_load + 1), 
+                                      color='REINF-6mo'), size=2) +
+                        scale_color_manual(values=c('#d95f02','#7570b3', '#1b9e77')) +
+                        theme_classic() + 
+                        theme(legend.position = c(0.15, 0.8),
+                              legend.title = element_blank())
+
+naive_plt
+```
+
+**Plot everything together**
+
+```{r}
+library(patchwork)
+
+naive_plt + pinf_plot + loss_plot + growth_plot + plot_layout(ncol = 2, nrow=2,) + plot_annotation(tag_levels = "A")
+ggsave("../../results/combined_REINF_plots.pdf", width=12, height=7)
+```
+
+
+# AGE Experiment
+
+Analysis and plotting for the AGE experiment described in the main text
+
+```{r}
+# Load in the zoo data
+zoodat = fread("../../data/lab_data/AGE_experiment_data.csv")
+```
+
+Visualize the data by groups.
+
+```{r}
+ggplot(zoodat, aes(x=day, y=log(ave_ZE + 1), color=as.factor(treatment), 
+                   group=as.factor(frog))) + 
+            geom_line() + facet_wrap(~wild_or_naive)
+
+```
+
+```{r}
+zoodat_dt = as.data.table(zoodat)
+```
+
+### Cleaning data
+
+There are a number of points that need to be removed from the analysis.
+In particular some frogs were treated with itraconozole at different points in the
+analysis, and all points after the treatment need to be excluded.
+
+```{r}
+# Find the all days after itracon. treatment on week 1 or week 3
+rm_itz_ind = ((zoodat$W1_ITCZ == 1) & (zoodat$day > 7)) | ((zoodat$W3_ITCZ == 1) & (zoodat$day > 21))
+rm_itz_ind
+
+# Remove the points where these conditions are TRUE
+zoodat_noitra = zoodat_dt[!rm_itz_ind, ]
+
+# Fix one mis-labeled point
+zoodat_noitra$day[zoodat_noitra$swab_id == "Tahoe098_W0"] = 0
+zoodat_noitra[tub == 17 & frog == 98,  ]
+
+ggplot(zoodat_noitra[tub == 17, ], aes(x=day, y=log(ave_ZE + 1), color=as.factor(frog))) + 
+            geom_line()
+```
+
+```{r}
+ggplot(zoodat_noitra, aes(x=day, y=log(ave_ZE + 1), color=as.factor(treatment), group=as.factor(frog))) + 
+            geom_line() + facet_wrap(~wild_or_naive)
+
+```
+
+```{r}
+# Add tub density as a covariate
+zoodat_noitra = merge(zoodat_noitra, zoodat_noitra[, list(density=length(unique(frog))), by=list(tub)], by="tub")
+```
+
+Plot the cleaned data
+
+```{r}
+zoodat_noitra$wild_or_naive = factor(zoodat_noitra$wild_or_naive, c('wild', 'naive'))
+med_zoo = zoodat_noitra[treatment==1, list(med_val=quantile(ave_ZE, 0.5)), by=list(day, wild_or_naive)]
+
+ggplot(zoodat_noitra[treatment == 1, ]) + 
+      geom_line(aes(x=day, y=log10(ave_ZE + 1), color=wild_or_naive, group=frog), alpha=0.3) + 
+      geom_line(data=med_zoo, aes(x=day, y=log10(med_val + 1), color=wild_or_naive), size=2) +
+      theme_bw() + ylab("log(ZE + 1)") + xlab("Days") + guides(color=guide_legend(title="Treatment"))
+```
+
+## Set-up the model to fit the IPM 
+
+```{r}
+# Split up the data by treatment
+trun_dat = zoodat_noitra[treatment == 1]
+plot_dat = trun_dat
+treatments = lapply(c("naive", "wild"), function(x) trun_dat[trun_dat$wild_or_naive == x, ])
+
+max_days = 6 # Maximum number of days
+max_frogs = 35 # Maximum number of frogs
+
+# Lists to hold results
+days_arrays = list()
+load_arrays = list()
+
+for(j in 1:length(treatments)){
+    
+    tdat = treatments[[j]]
+    days = array(-1, dim=c(max_frogs, max_days))
+    loads = array(-1, dim=c(max_frogs, max_days))
+    
+    for(i in 1:length(unique(tdat$frog))){
+        
+        frog_id = unique(tdat$frog)[i]
+        temp = tdat[tdat$frog == frog_id, .(day, ave_ZE)][order(day)]
+        temp = temp[day != 8]
+        
+        days[i, 1:length(temp$day)] = temp$day
+        loads[i, 1:length(temp$day)] = temp$ave_ZE
+
+    }
+    
+    days_arrays[[j]] = days
+    load_arrays[[j]] = loads
+}
+        
+```
+
+```{r}
+days_arrays
+```
+
+```{r}
+# Fitting the stan model
+stan_data = list(T=2, H=max_frogs, 
+                 time_steps=max_days, 
+                 samps=load_arrays,  
+                 days=days_arrays)
+```
+
+## Fit the model
+
+Fit the Stan model as described in the Appendix
+
+```{r}
+age_mod1 = stan("stan_models/age_ipm_model.stan", data=stan_data, 
+                        warmup=1000, iter=5000, chains=4, cores=4)
+```
+
+Check model convergence
+
+```{r}
+summary_matrix = summary(age_mod1)$summary
+summary_matrix
+traceplot(age_mod1, pars=row.names(summary_matrix)[1:7])
+```
+
+### Growth of infection
+
+```{r}
+mod_params = rstan::extract(age_mod1)
+zvals = seq(4, 11, length=100)
+naive_growth = sapply(zvals, function(z) mod_params$bg0 + z*(mod_params$bg1)) %>% 
+               apply(2, quantile, quants) %>% 
+                t() %>% 
+                as.data.frame()
+treatA_growth = sapply(zvals, function(z) mod_params$bg0 + z*(mod_params$bg1 + mod_params$bg_tA) + mod_params$bg_tA2
+                     ) %>% 
+                apply(2, quantile, quants) %>% 
+                t() %>% 
+                as.data.frame()
+
+naive_growth$treatment = "AGE-N"
+treatA_growth$treatment = "AGE-12mo"
+
+growth_dat = rbind(naive_growth, treatA_growth)
+growth_dat$treatment = factor(growth_dat$treatment, levels=c("AGE-N", "AGE-12mo"))
+growth_dat$lgzoo = log10(exp(rep(zvals, 2)))
+
+#Drop treatment A because there is no information to infer this
+colnames(growth_dat) = c("lower", "median", "upper", "Treatment", "lgzoo")
+
+growthplot = ggplot(data=growth_dat) + 
+             geom_line(aes(x=lgzoo, y=log10(exp(median)), color=Treatment)) +
+             geom_ribbon(aes(x=lgzoo, ymax=log10(exp(upper)), ymin=log10(exp(lower)), fill=Treatment), 
+                         alpha=0.2, size=0) + 
+             scale_fill_manual(values = c('#1b9e77','#7570b3')) +
+             scale_color_manual(values = c('#1b9e77','#7570b3')) +
+             theme_classic() + xlab(expression(log[10]*"(Bd intensity) at time "*italic(t))) +
+             ylab(expression(log[10]*"(Bd intensity) at time "*italic(t)*" + 1")) +
+             geom_line(data=as.data.frame(zvals), aes(x=log10(exp(zvals)), y=log10(exp(zvals))), 
+                       color="black", linetype="dashed")
+
+# Plot observed growth data on this plot as well
+growth_dat_reinf = trun_dat[, list(sizeZE=ave_ZE[1:(length(ave_ZE) - 1)],
+                              sizeZENext=ave_ZE[2:length(ave_ZE)],
+                              Treatment=unique(wild_or_naive)), by=c("frog")]
+
+growth_dat_reinf
+growth_dat_reinf$Treatment = plyr::revalue(growth_dat_reinf$Treatment, c('wild'="AGE-12mo", "naive"="AGE-N"))
+growth_dat_reinf$Treatment = factor(growth_dat_reinf$Treatment, levels=c("AGE-N", "AGE-12mo"))
+# 
+growthplot = growthplot + geom_point(data=growth_dat_reinf[(sizeZE > 0 & sizeZENext > 0), ], 
+                                     aes(x=log10(sizeZE), y=log10(sizeZENext), color=Treatment), pch=21) +
+                           scale_color_manual(values = c('#1b9e77','#7570b3')) + theme(legend.position = "none")
+growthplot
+```
+
+### Plot the model predictions
+
+```{r}
+
+ipm_sim_age = function(num, time_steps, params, treatment){
+  # Simulating an individual frog trajectory from the fitted model (based on model ipm_mod8D)
+  # 
+  # num : int, a simulation number
+  # time_steps : number of discrete time steps to simulate the model
+  # params: A vector of ipm parameters
+  # treatment: Either "naive" or "wild"
+  
+  times = 0:time_steps
+  init_load = 0
+  loads = array(NA, dim=length(times))
+  
+  # Set treatment coeffs
+  if(treatment == "naive"){
+    treat_coefs = 0
+  } else {
+    treat_coefs = 1
+  } 
+  
+  loads[1] = init_load
+  
+  for(i in 2:(time_steps + 1)){
+    
+    current_load = loads[i - 1]
+    
+    # Transmission
+    if(current_load == 0){
+      
+      if(i == 2)
+        trans = 1
+      else
+        trans = 1
+      
+      next_load = trans * exp(rnorm(1, mean=params['binit0'], sd=params['sigma_init']))
+      
+    } else if(current_load > 0){ # Loss of infection or growth
+      
+      loss = 0
+      next_load = (1  - loss) * exp(rnorm(1, mean=params['bg0'] + params['bg_tA2']*treat_coefs +
+                                                  log(current_load)*(params['bg1'] + params['bg_tA']*treat_coefs),
+                                             sd=params['sigma_growth']) )
+      
+    }
+    
+    loads[i] = next_load
+    
+  }
+  
+  return(cbind(loads=loads, time=times, simid=rep(num, length(loads))))
+  
+}
+
+```
+
+```{r}
+names(mod_params)
+```
+
+```{r}
+all_params = as.data.frame(mod_params[names(mod_params)])[, 1:7]
+med_params = apply(all_params, 2, quantile, 0.5)
+
+traj = do.call(rbind, lapply(1:1000, function(i) ipm_sim_age(i, 4, med_params, "naive"))) %>% as.data.frame()
+traj_med = as.data.frame(as.data.table(traj)[, list(med_load=median(loads), 
+                                                    lower=quantile(loads, 0.025), 
+                                                    upper=quantile(loads, 0.975)), by=c("time")])
+
+# Naive
+naive_plt = ggplot() + 
+          geom_line(data=plot_dat[wild_or_naive == "naive", ], aes(x=day, y=log10(ave_ZE + 1), group=as.factor(frog), color='AGE-N'), alpha=0.5) +
+          geom_line(data=traj_med, aes(x=time*7, y=log10(med_load + 1), color='AGE-N'), size=2) +
+          theme_classic() + xlab("Time in days") + ylab(expression(log[10]*"(Bd intensity + 1)")) + ylim(0, 6)
+
+naive_plt
+
+# Plot Age-12mo
+all_params = as.data.frame(mod_params[names(mod_params)])[, 1:7]
+med_params = apply(all_params, 2, quantile, 0.5)
+
+traj = do.call(rbind, lapply(1:1000, function(i) ipm_sim_age(i, 4, med_params, "wild"))) %>% as.data.frame()
+traj_med = as.data.frame(as.data.table(traj)[, list(med_load=median(loads), 
+                                                    lower=quantile(loads, 0.025), 
+                                                    upper=quantile(loads, 0.975)), by=c("time")])
+
+# Naive
+naive_plt = naive_plt +
+          # geom_line(data=traj[traj$simid < 25, ], aes(x=time*7, y=log10(loads + 1), group=simid), color="black", alpha=0.2) +
+          geom_line(data=plot_dat[wild_or_naive == "wild", ], aes(x=day, y=log10(ave_ZE + 1), group=as.factor(frog), color='AGE-12mo'), alpha=0.5) +
+          geom_line(data=traj_med, aes(x=time*7, y=log10(med_load + 1), color='AGE-12mo'), size=2) + scale_color_manual(values=c("#7570b3", "#1b9e77")) + theme(legend.position=c(0.15, 0.85), legend.title = element_blank())
+
+naive_plt
+```
+
+```{r}
+naive_plt + growthplot + plot_annotation(tag_levels = "A")
+ggsave("../../results/combined_AGE_plots.pdf", width=10, height=3.5)
+```
+
+### Get predicted equilibrium load
+
+
+```{r}
+naive_equil = log10(exp(mod_params$bg0 / (1 - mod_params$bg1)))
+wild_equil = log10(exp((mod_params$bg0 + mod_params$bg_tA2) / (1 - (mod_params$bg1 + mod_params$bg_tA))))
+
+
+quantile(wild_equil, c(0.025, 0.5, 0.975))
+quantile(naive_equil, c(0.025, 0.5, 0.975))
+```

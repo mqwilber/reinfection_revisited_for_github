@@ -1,0 +1,1185 @@
+---
+title: "Analysis code for CMR data fitting"
+author: "Mark Wilber"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    highlight: tango    # nicer code highlighting
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+
+```{r, message=FALSE}
+library(data.table)
+library(ggplot2)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(lubridate)
+source("ipm_simulation.R")
+
+# Specify whether to fit the models or load from disk
+fit_model = TRUE
+```
+
+# Fit all of the CMR data across sites
+
+## Hold cross-site results
+
+```{r}
+all_percentages = list()
+```
+
+# The data: 22008
+
+```{r}
+source("ipm_simulation.R")
+site = "22008"
+
+# Load site-level data
+fdat = load_field_data(site)
+capture = fdat$capture
+survey = fdat$survey
+initial = fdat$initial
+
+# How many recaptures in different primary periods?
+recaptures = capture[, .(primary_period=unique(primary_period)), by=.(pit_tag_id)]
+counts = recaptures[, .(count=.N), by=.(pit_tag_id)]
+```
+
+## Exploratory data analysis
+
+When were the releases relative to the primary periods?
+
+```{r}
+# Plot releases and primary periods
+ggplot(survey) + geom_point(aes(x=survey_date, y=primary_period, color=as.factor(primary_period))) +
+                 geom_vline(aes(xintercept=unique(capture$release_date)[1])) +
+                  geom_vline(aes(xintercept=unique(capture$release_date)[2]))
+
+# What are the release dates?
+unique(capture$release_date)
+
+survey[survey_date >= unique(capture$release_date)[1]][, .(secondary_periods=length(secondary_period)) , by=.(primary_period)]
+
+# Last survey
+max(survey$survey_date)
+
+primary_periods_dt = survey[, .(mean_survey_date=mean(survey_date)), by=.(primary_period)]
+primary_periods_dt$mean_survey_date = as.Date(primary_periods_dt$mean_survey_date)
+```
+
+Plot individual trajectories
+
+```{r}
+
+# Drop the captures where no swabs were taken
+capture_nona = capture[!is.na(bd_load)]
+keep_inds = counts[count >= 1]$pit_tag_id
+no_recapture = setdiff(initial$pit_tag_id, capture_nona$pit_tag_id)
+no_recap_count = initial[pit_tag_id %in% no_recapture][, .(count=.N), by=.(treatment)][order(treatment)]
+all_count = initial[, .(count=.N), by=.(treatment)][order(treatment)]
+
+all_count$percent_no_recapture = no_recap_count$count / all_count$count
+all_count$site = site
+all_percentages[[site]] = all_count
+
+ggplot(capture_nona[pit_tag_id %in% keep_inds], 
+       aes(x=survey_date, y=log(bd_load + 1), color=as.factor(pit_tag_id))) + 
+  geom_line() + geom_point() + facet_wrap(~treatment) + 
+  #geom_vline(data=survey, aes(xintercept = survey_date), color='gray', alpha=0.2) +
+  guides(color = FALSE) + 
+  theme_classic() + ylab("log(Bd load + 1)") + xlab("Date")
+
+capture_nona$frog_id = as.integer(as.factor(capture_nona$pit_tag_id))
+
+strip_labels <- setNames(
+  paste0(all_count$treatment, " (No recapture = ", round(all_count$percent_no_recapture, 2)*100, "%)"),
+  all_count$treatment)
+
+ggplot(capture_nona[pit_tag_id %in% keep_inds], 
+       aes(x=survey_date, y=as.factor(frog_id))) + 
+  geom_line(linewidth=0.1) + geom_point(aes(color=log10(bd_load + 1), shape=as.factor(release_date)), size=3) + 
+  geom_vline(aes(xintercept=unique(capture$release_date)[1]), linewidth=0.2, color='red') +
+  geom_vline(aes(xintercept=unique(capture$release_date)[2]),  linewidth=0.2, color='red') +
+  geom_vline(data=primary_periods_dt, aes(xintercept=mean_survey_date), linetype="dashed", linewidth=0.1, color='gray') +
+  facet_wrap(~treatment, scale="free_y", labeller = as_labeller(strip_labels)) +
+  scale_color_viridis_b() +
+  labs(color = expression(log[10]*"(Bd intensity + 1)"), shape = "Release date") +
+  theme_classic() + ylab("Frog ID") + xlab("Date") + 
+  theme(axis.text.y = element_text(size = 6),
+        legend.title=element_text(size=9))
+
+ggsave(paste0("../../../results/", site, "_field_trajectories.pdf"), width=8, height=5)
+```
+
+Exploratory comparison of infection intensity among treatments
+
+```{r}
+ggplot(capture_nona[bd_load > 0]) + geom_boxplot(aes(x=treatment, y=log(bd_load)))
+capture_nona[bd_load > 0][, .(mean_load=mean(log(bd_load))), by=.(treatment)]
+```
+
+## Format the data for CMR fitting
+
+```{r}
+
+# Data formatting parameters. Set this up to bin by load so that a continuous model could be fit.
+# Note that we are not fitting the continuous load model here, but this is a more general approach. 
+
+scale = 1 # Scale for better fitting. Divide natural scale load by this value before logging.
+bins = 50 # Number of load bins
+min_size = -6 # Lower bound (depends on scale)
+max_size = 20 # Upper bound (depends on scale)
+time_step = 7 # Model time step in days
+
+mdat = format_field_data_for_fitting(scale, bins, min_size, max_size, 
+                                     time_step, capture, survey, initial, site)
+```
+
+Set up the formatted data for the Stan model fitting
+
+```{r}
+keep_inds = 1:nrow(mdat$obs_states_noload)
+tobs_states = mdat$obs_states[keep_inds, ]
+tsecondary_obs = mdat$secondary_obs[keep_inds, ]
+tsecondary_periods = mdat$secondary_periods[keep_inds, ]
+tobs_states_noload = mdat$obs_states_noload[keep_inds, ]
+texposure = mdat$exposure[keep_inds]
+tload_states = mdat$load_states[keep_inds, ]
+
+# Assign cohort information. There are two released cohorts for site 22008
+cohort = ifelse(tobs_states[, 1] != -1, 1, 2)
+cohort2_ind = which.max(tobs_states[, 1] == -1)
+t2 = which(mdat$obs_states[cohort2_ind, ] != -1)[1] # Time step where we can actually observe the second cohort
+```
+
+## Set-up the Stan data
+
+```{r}
+
+# Set-up stan data for no load CMR model
+standata_noload = list(
+      T=ncol(tobs_states_noload),
+      N=nrow(tobs_states_noload),
+      obs_states = tobs_states_noload,
+      secondary_periods=tsecondary_periods,
+      secondary_obs=tsecondary_obs,
+      load=tload_states,
+      num_states=3,
+      exposure=texposure,
+      cohort=cohort,
+      t2=t2
+)
+```
+
+## Model fitting
+
+Load the Stan models.
+
+```{r}
+model_noload = cmdstan_model(stan_file="stanfiles/cmr_field_exposure.stan")
+```
+
+Fit the CMR model
+
+```{r}
+if(fit_model){
+  fit_noload = model_noload$sample(data=standata_noload, iter_warmup=800, 
+                                   iter_sampling = 2000, 
+                                   chains=4, parallel_chains = 4, 
+                                   adapt_delta=0.93)
+  saveRDS(fit_noload, file.path("..", "..", "..", "results", paste0(site, "_mcmc", ".rds")))
+} else {
+  fit_noload = readRDS(file.path("..", "..", "..", "results", paste0(site, "_mcmc", ".rds")))
+}
+```
+
+## Examine model output
+
+Examine fitting diagnostics
+
+```{r}
+fit_noload$summary()
+```
+
+Check diagnostics
+
+```{r}
+draw_df = as_draws_df(fit_noload$draws())
+mcmc_trace(draw_df)
+mcmc_rank_overlay(draw_df)
+```
+
+Here, we are simply drawing from the posteriors and then projecting the transition matricies forward in time
+to predict the survival curves for exposed and unexposed frogs.
+
+```{r}
+post_draws = as_draws_df(fit_noload$draws())
+
+# Extract params
+mparams = as.list(colMeans(post_draws))
+rand_draws = 200 # Number of random curves to generate
+steps = 162 # Duration of the forward simulation
+curves_unexp = array(NA, dim=c(steps + 1, rand_draws))
+curves_exp = array(NA, dim=c(steps + 1, rand_draws))
+
+for(i in 1:rand_draws){
+  
+  j = sample(1:500, 1)
+  mparams = post_draws[j, ]
+  
+  # Set-up transition matrix parameters: Unexposed
+  surv_prob0 = pnorm(mparams$surv_int)
+  surv_probinf = average_probit(mparams$surv_int, -1*mparams$surv_slope, 
+                                mparams$mean_load, mparams$sigma_load)
+  trans_prob = pnorm(mparams$trans_int)
+  loss_prob = average_probit(mparams$loss_int, mparams$loss_slope, 
+                             mparams$mean_load, mparams$sigma_load)
+  
+  # Set-up transition matrix parameters: Exposed
+  surv_prob0_e = pnorm(mparams$surv_int + mparams$surv_int_exposure)
+  surv_probinf_e = average_probit(mparams$surv_int + mparams$surv_int_exposure,
+                                  -1*mparams$surv_slope, 
+                                  mparams$mean_load + mparams$mean_load_exposure,
+                                  mparams$sigma_load*exp(mparams$sigma_load_exposure))
+  loss_prob_e = average_probit(mparams$loss_int + mparams$loss_int_exposure, 
+                               mparams$loss_slope,  
+                               mparams$mean_load + mparams$mean_load_exposure,
+                               mparams$sigma_load*exp(mparams$sigma_load_exposure))
+
+  Tmat_unexp = array(NA, dim=c(3, 3))
+  Tmat_exp = array(NA, dim=c(3, 3))
+  Tmat_unexp[3, ] = c(0, 0, 1) # If you are dead, stay dead
+  Tmat_unexp[1, ] = c(surv_prob0*(1 - trans_prob), surv_prob0*trans_prob, 1 - surv_prob0)
+  Tmat_unexp[2, ] = c(surv_probinf*(loss_prob), surv_probinf*(1 - loss_prob), 1 - surv_probinf)
+  
+  Tmat_exp[3, ] = c(0, 0, 1)
+  Tmat_exp[1, ] = c(surv_prob0_e*(1 - trans_prob), surv_prob0_e*trans_prob, 1 - surv_prob0_e)
+  Tmat_exp[2, ] = c(surv_probinf_e*(loss_prob_e), surv_probinf_e*(1 - loss_prob_e), 1 - surv_probinf_e)
+  
+  init = c(1, 0, 0)
+  surv_probs = array(NA, dim=steps)
+  states = array(NA, dim=c(3, steps + 1))
+  states_e = array(NA, dim=c(3, steps + 1))
+  states[, 1] = init
+  states_e[, 1] = init
+  
+  for(t in 1:steps){
+    states[, t + 1] = states[, t] %*% Tmat_unexp
+    states_e[, t + 1] = states_e[, t] %*% Tmat_exp
+  }
+  
+  curves_unexp[, i] = 1 - states[3, ]
+  curves_exp[, i] = 1 - states_e[3, ]
+
+}
+```
+
+```{r}
+library(reshape2)
+
+# Plot the curves
+melt_ce = melt(curves_exp)
+melt_cue = melt(curves_unexp)
+colnames(melt_ce) = c("time", "sample", "surv_prob")
+colnames(melt_cue) = c("time", "sample", "surv_prob")
+melt_ce$exposure = "exposed"
+melt_cue$exposure = "unexposed"
+all_trajs = as.data.table(rbind(melt_ce, melt_cue))
+all_trajs_sum = all_trajs[, .(median=median(surv_prob), 
+                              lower=quantile(surv_prob, 0.05), 
+                              upper=quantile(surv_prob, 0.95)),
+                          by=.(exposure, time)]
+
+t_p1 = ggplot() +
+           geom_line(data=all_trajs_sum, aes(x=(time - 1)*time_step / 365, 
+                                             y=median, color=exposure), size=2) +
+           geom_ribbon(data=all_trajs_sum, aes(x=(time - 1)*time_step / 365, 
+                                               ymin=lower, ymax=upper, 
+                                               fill=exposure), alpha=0.5) +
+           theme_classic() + xlab("Years") + ylab("Survival probability") + 
+           theme(legend.position = c(0.75, 0.9))
+
+t_p1
+        
+```
+
+```{r}
+all_trajs_sum[time == 53]
+```
+
+Makes the parameter plots
+
+```{r}
+compare_vars = c("surv_int_exposure", "loss_int_exposure", 
+                 "mean_load_exposure", "sigma_load_exposure")
+compare_draws = fit_noload$draws(variables = compare_vars)
+t_p2 = bayesplot::mcmc_areas(compare_draws, prob=0.95) + xlab("Effect size")
+t_p2 = t_p2 +
+  scale_y_discrete(
+    labels = c(
+      "sigma_load_exposure"     = expression(s[1] * "," ~ "variance effect"),
+      "mean_load_exposure" = expression(gamma[1] * "," ~ "intensity effect"),
+      "loss_int_exposure"     = expression(alpha[1] * "," ~ "loss effect"),
+      "surv_int_exposure"  = expression(beta[1] * "," ~ "survival effect")
+    )
+  )
+t_p2
+```
+
+```{r}
+library(patchwork)
+t_p2 + t_p1
+ggsave(paste0("../../../results/", site, "_model_results.pdf"), width=8, height=4)
+```
+
+# The data: 20135
+
+```{r}
+source("ipm_simulation.R")
+site = "20135"
+
+fdat = load_field_data(site)
+capture = fdat$capture
+survey = fdat$survey
+initial = fdat$initial
+
+# How many recaptures in different primary periods?
+recaptures = capture[, .(primary_period=unique(primary_period)), by=.(pit_tag_id)]
+counts = recaptures[, .(count=.N), by=.(pit_tag_id)]
+
+primary_periods_dt = survey[, .(mean_survey_date=mean(survey_date)), by=.(primary_period)]
+primary_periods_dt$mean_survey_date = as.Date(primary_periods_dt$mean_survey_date)
+```
+
+## Exploratory data analysis
+
+When were the releases relative to the primary periods?
+
+```{r}
+unique(capture$release_date)
+ggplot(survey) + geom_point(aes(x=survey_date, y=primary_period, 
+                                color=as.factor(primary_period))) +
+                 geom_vline(aes(xintercept=unique(capture$release_date)[1])) +
+                 geom_vline(aes(xintercept=unique(capture$release_date)[2]))
+
+unique(capture$release_date)
+survey[survey_date >= unique(capture$release_date)[1]][, .(secondary_periods=length(secondary_period)) , by=.(primary_period)]
+
+max(survey$survey_date)
+```
+
+Plot individual trajectories
+
+```{r}
+
+# Drop the captures where no swabs were taken
+capture_nona = capture[!is.na(bd_load)]
+keep_inds = counts[count >= 1]$pit_tag_id
+no_recapture = setdiff(initial$pit_tag_id, capture_nona$pit_tag_id)
+no_recap_count = initial[pit_tag_id %in% no_recapture][, .(count=.N), by=.(treatment)][order(treatment)]
+all_count = initial[, .(count=.N), by=.(treatment)][order(treatment)]
+all_count
+
+all_count$percent_no_recapture = no_recap_count$count / all_count$count
+all_count$site = site
+all_percentages[[site]] = all_count
+
+ggplot(capture_nona[pit_tag_id %in% keep_inds], 
+       aes(x=survey_date, y=log(bd_load + 1), color=as.factor(pit_tag_id))) + 
+  geom_line() + geom_point() + facet_wrap(~treatment) + 
+  #geom_vline(data=survey, aes(xintercept = survey_date), color='gray', alpha=0.2) +
+  guides(color = FALSE) + 
+  theme_classic() + ylab("log(Bd load + 1)") + xlab("Date")
+
+capture_nona$frog_id = as.integer(as.factor(capture_nona$pit_tag_id))
+
+strip_labels <- setNames(
+  paste0(all_count$treatment, " (No recapture = ", round(all_count$percent_no_recapture, 2)*100, "%)"),
+  all_count$treatment)
+
+ggplot(capture_nona[pit_tag_id %in% keep_inds], 
+       aes(x=survey_date, y=as.factor(frog_id))) + 
+  geom_line(linewidth=0.1) + geom_point(aes(color=log10(bd_load + 1), shape=as.factor(release_date)), size=2) + 
+  geom_vline(aes(xintercept=unique(capture$release_date)[1]), linewidth=0.2, color='red') +
+  geom_vline(aes(xintercept=unique(capture$release_date)[2]),  linewidth=0.2, color='red') +
+  geom_vline(data=primary_periods_dt, aes(xintercept=mean_survey_date), linetype="dashed", linewidth=0.1, color='gray') +
+  facet_wrap(~treatment, scale="free_y", labeller = as_labeller(strip_labels)) +
+  scale_color_viridis_b() +
+  labs(color = expression(log[10]*"(Bd intensity + 1)"), shape = "Release date") +
+  theme_classic() + ylab("Frog ID") + xlab("Date") + 
+  theme(axis.text.y = element_text(size = 6),
+        legend.title=element_text(size=9))
+
+ggsave(paste0("../../../results/", site, "_field_trajectories.pdf"), width=8, height=5)
+
+```
+
+Basic plot comparing infection intensity
+
+```{r}
+ggplot(capture_nona[bd_load > 0]) + geom_boxplot(aes(x=treatment, y=log(bd_load)))
+```
+
+## Format the data for CMR fitting
+
+```{r}
+# Data formatting parameters
+
+scale = 1 # Scale for better fitting. Divide natural scale load by this value before logging.
+bins = 50 # Number of load bins
+min_size = -6 # Lower bound
+max_size = 20 # Upper bound
+time_step = 7 # Model time step in days
+
+mdat = format_field_data_for_fitting(scale, bins, min_size, max_size, 
+                                     time_step, capture, survey, initial, site)
+```
+
+```{r}
+keep_inds = 1:nrow(mdat$obs_states)
+tobs_states = mdat$obs_states[keep_inds, ]
+tsecondary_obs = mdat$secondary_obs[keep_inds, ]
+tsecondary_periods = mdat$secondary_periods[keep_inds, ]
+tobs_states_noload = mdat$obs_states_noload[keep_inds, ]
+texposure = mdat$exposure[keep_inds]
+tload_states = mdat$load_states[keep_inds, ]
+
+# This site has two release cohorts
+cohort = ifelse(tobs_states[, 1] != -1, 1, 2)
+cohort2_ind = which.max(tobs_states[, 1] == -1)
+t2 = which(mdat$obs_states[cohort2_ind, ] != -1)[1]
+```
+
+## Set-up the Stan data
+
+```{r}
+# Set-up stan data for no load CMR model
+standata_noload = list(
+      T=ncol(tobs_states_noload),
+      N=nrow(tobs_states_noload),
+      obs_states = tobs_states_noload,
+      secondary_periods=tsecondary_periods,
+      secondary_obs=tsecondary_obs,
+      load=tload_states,
+      num_states=3,
+      exposure=texposure,
+      cohort=cohort,
+      t2=t2
+)
+```
+
+## Model fitting
+
+```{r}
+model_noload = cmdstan_model(stan_file="stanfiles/cmr_field_exposure.stan")
+```
+
+Fit the no load CMR model
+
+```{r}
+if(fit_model){
+  fit_noload = model_noload$sample(data=standata_noload, iter_warmup=500, 
+                                   iter_sampling = 1500, 
+                                   chains=4, parallel_chains = 4)
+  saveRDS(fit_noload, file.path("..", "..", "..", "results", paste0(site, "_mcmc", ".rds")))
+} else {
+  fit_noload = readRDS(file.path("..", "..", "..", "results", paste0(site, "_mcmc", ".rds")))
+}
+```
+
+## Examine model output
+
+Examine fitting diagnostics
+
+```{r}
+fit_noload$summary()
+```
+
+```{r}
+draw_df = as_draws_df(fit_noload$draws())
+mcmc_trace(draw_df)
+```
+
+Examine the model-predicted survival curve
+
+```{r}
+post_draws = as_draws_df(fit_noload$draws())
+
+# Extract params
+mparams = as.list(colMeans(post_draws))
+rand_draws = 200
+steps = 162
+curves_unexp = array(NA, dim=c(steps + 1, rand_draws))
+curves_exp = array(NA, dim=c(steps + 1, rand_draws))
+
+for(i in 1:rand_draws){
+  
+  j = sample(1:500, 1)
+  mparams = post_draws[j, ]
+  
+  # Set-up transition matrix parameters: Unexposed
+  surv_prob0 = pnorm(mparams$surv_int)
+  surv_probinf = average_probit(mparams$surv_int, -1*mparams$surv_slope, 
+                                mparams$mean_load, mparams$sigma_load)
+  trans_prob = pnorm(mparams$trans_int)
+  loss_prob = average_probit(mparams$loss_int, mparams$loss_slope, 
+                             mparams$mean_load, mparams$sigma_load)
+  
+  # Set-up transition matrix parameters: Exposed
+  surv_prob0_e = pnorm(mparams$surv_int + mparams$surv_int_exposure)
+  surv_probinf_e = average_probit(mparams$surv_int + mparams$surv_int_exposure,
+                                  -1*mparams$surv_slope, 
+                                  mparams$mean_load + mparams$mean_load_exposure,
+                                  mparams$sigma_load*exp(mparams$sigma_load_exposure))
+  loss_prob_e = average_probit(mparams$loss_int + mparams$loss_int_exposure, 
+                               mparams$loss_slope,  
+                               mparams$mean_load + mparams$mean_load_exposure,
+                               mparams$sigma_load*exp(mparams$sigma_load_exposure))
+  # Build the transition matrix
+  Tmat_unexp = array(NA, dim=c(3, 3))
+  Tmat_exp = array(NA, dim=c(3, 3))
+  Tmat_unexp[3, ] = c(0, 0, 1)
+  Tmat_unexp[1, ] = c(surv_prob0*(1 - trans_prob), surv_prob0*trans_prob, 1 - surv_prob0)
+  Tmat_unexp[2, ] = c(surv_probinf*(loss_prob), surv_probinf*(1 - loss_prob), 1 - surv_probinf)
+  
+  Tmat_exp[3, ] = c(0, 0, 1)
+  Tmat_exp[1, ] = c(surv_prob0_e*(1 - trans_prob), surv_prob0_e*trans_prob, 1 - surv_prob0_e)
+  Tmat_exp[2, ] = c(surv_probinf_e*(loss_prob_e), surv_probinf_e*(1 - loss_prob_e), 1 - surv_probinf_e)
+  
+  init = c(1, 0, 0)
+  surv_probs = array(NA, dim=steps)
+  states = array(NA, dim=c(3, steps + 1))
+  states_e = array(NA, dim=c(3, steps + 1))
+  states[, 1] = init
+  states_e[, 1] = init
+  
+  for(t in 1:steps){
+    states[, t + 1] = states[, t] %*% Tmat_unexp
+    states_e[, t + 1] = states_e[, t] %*% Tmat_exp
+  }
+  
+  curves_unexp[, i] = 1 - states[3, ]
+  curves_exp[, i] = 1 - states_e[3, ]
+
+}
+```
+
+```{r}
+# Plot the curves
+melt_ce = melt(curves_exp)
+melt_cue = melt(curves_unexp)
+colnames(melt_ce) = c("time", "sample", "surv_prob")
+colnames(melt_cue) = c("time", "sample", "surv_prob")
+melt_ce$exposure = "exposed"
+melt_cue$exposure = "unexposed"
+all_trajs = as.data.table(rbind(melt_ce, melt_cue))
+all_trajs_sum = all_trajs[, .(median=median(surv_prob), lower=quantile(surv_prob, 0.05), upper=quantile(surv_prob, 0.95)),by=.(exposure, time)]
+
+r_p1 = ggplot() +
+           geom_line(data=all_trajs_sum, aes(x=(time - 1)*time_step / 365, 
+                                             y=median, color=exposure), size=2) +
+           geom_ribbon(data=all_trajs_sum, aes(x=(time - 1)*time_step / 365, 
+                                               ymin=lower, ymax=upper, fill=exposure), alpha=0.5) +
+           theme_classic() + xlab("Years") + ylab("Survival probability") + 
+           theme(legend.position = c(0.75, 0.9))
+r_p1         
+```
+
+```{r}
+all_trajs_sum[time == 53]
+```
+
+```{r}
+compare_vars = c("surv_int_exposure", "loss_int_exposure", "mean_load_exposure", "sigma_load_exposure")
+compare_draws = fit_noload$draws(variables = compare_vars)
+r_p2 = bayesplot::mcmc_areas(compare_draws, prob=0.95) + xlab("Effect size")
+
+r_p2 = r_p2 + 
+    scale_y_discrete(
+    labels = c(
+      "sigma_load_exposure"     = expression(s[1] * "," ~ "variance effect"),
+      "mean_load_exposure" = expression(gamma[1] * "," ~ "intensity effect"),
+      "loss_int_exposure"     = expression(alpha[1] * "," ~ "loss effect"),
+      "surv_int_exposure"  = expression(beta[1] * "," ~ "survival effect")
+    )
+  )
+r_p2
+```
+
+```{r}
+r_p2 + r_p1
+ggsave(paste0("../../../results/", site, "_model_results.pdf"), width=8, height=4)
+```
+
+# The data: 50785
+
+```{r}
+source("ipm_simulation.R")
+site = "50785"
+
+fdat = load_field_data(site)
+capture = fdat$capture
+survey = fdat$survey
+initial = fdat$initial
+
+# How many recaptures in different primary periods?
+recaptures = capture[, .(primary_period=unique(primary_period)), by=.(pit_tag_id)]
+counts = recaptures[, .(count=.N), by=.(pit_tag_id)]
+
+table(initial$treatment)
+survey
+
+primary_periods_dt = survey[, .(mean_survey_date=mean(survey_date)), by=.(primary_period)]
+primary_periods_dt$mean_survey_date = as.Date(primary_periods_dt$mean_survey_date)
+```
+
+### Exploratory data analysis
+
+When were the releases relative to the primary periods?
+
+```{r}
+unique(capture$release_date)
+ggplot(survey) + geom_point(aes(x=survey_date, y=primary_period, color=as.factor(primary_period))) +
+                 geom_vline(aes(xintercept=unique(capture$release_date)[1])) +
+                  geom_vline(aes(xintercept=unique(capture$release_date)[2]))
+
+unique(capture$release_date)
+survey[survey_date >= unique(capture$release_date)[1]][, .(secondary_periods=length(secondary_period)) , by=.(primary_period)]
+
+max(survey$survey_date)
+```
+
+Plot individual trajectories
+
+```{r}
+
+# Drop the captures where no swabs were taken
+capture_nona = capture[!is.na(bd_load)]
+keep_inds = counts[count >= 1]$pit_tag_id
+no_recapture = setdiff(initial$pit_tag_id, capture_nona$pit_tag_id)
+no_recap_count = initial[pit_tag_id %in% no_recapture][, .(count=.N), by=.(treatment)][order(treatment)]
+all_count = initial[, .(count=.N), by=.(treatment)][order(treatment)]
+all_count
+
+all_count$percent_no_recapture = no_recap_count$count / all_count$count
+all_count$site = site
+all_percentages[[site]] = all_count
+
+ggplot(capture_nona[pit_tag_id %in% keep_inds], 
+       aes(x=survey_date, y=log(bd_load + 1), color=as.factor(pit_tag_id))) + 
+  geom_line() + geom_point() + facet_wrap(~treatment) + 
+  #geom_vline(data=survey, aes(xintercept = survey_date), color='gray', alpha=0.2) +
+  guides(color = FALSE) + 
+  theme_classic() + ylab("log(Bd load + 1)") + xlab("Date")
+
+capture_nona$frog_id = as.integer(as.factor(capture_nona$pit_tag_id))
+
+strip_labels = setNames(
+  paste0(all_count$treatment, " (No recapture = ", round(all_count$percent_no_recapture, 2)*100, "%)"),
+  all_count$treatment)
+
+ggplot(capture_nona[pit_tag_id %in% keep_inds], 
+       aes(x=survey_date, y=as.factor(frog_id))) + 
+  geom_line(linewidth=0.1) + geom_point(aes(color=log10(bd_load + 1), shape=as.factor(release_date)), size=3) + 
+  geom_vline(aes(xintercept=unique(capture$release_date)[1]), linewidth=0.2, color='red') +
+  geom_vline(data=primary_periods_dt, aes(xintercept=mean_survey_date), linetype="dashed", linewidth=0.1, color='gray') +
+  facet_wrap(~treatment, scale="free_y", labeller = as_labeller(strip_labels)) +
+  scale_color_viridis_b() +
+  scale_x_date(limits = c(min(survey$survey_date), max(survey$survey_date))) +
+  labs(color = expression(log[10]*"(Bd intensity + 1)"), shape = "Release date") +
+  guides(color = guide_colorbar(order = 2),
+         shape = guide_legend(order = 1)) +
+  theme_classic() + ylab("Frog ID") + xlab("Date") + 
+  theme(axis.text.y = element_text(size = 6),
+        legend.title=element_text(size=9))
+
+ggsave(paste0("../../../results/", site, "_field_trajectories.pdf"), width=8, height=5)
+
+```
+
+Basic plot comparing infection intensity
+
+```{r}
+ggplot(capture_nona[bd_load > 0]) + geom_boxplot(aes(x=treatment, y=log(bd_load)))
+```
+
+### Format the data for CMR fitting
+
+```{r}
+source("ipm_simulation.R")
+
+# Data formatting parameters
+
+scale = 1 # Scale for better fitting. Divide natural scale load by this value before logging.
+bins = 50 # Number of load bins
+min_size = -6 # Lower bound
+max_size = 20 # Upper bound
+time_step = 7 # Model time step in days
+
+mdat = format_field_data_for_fitting(scale, bins, min_size, max_size, time_step, capture, survey, initial, site)
+```
+
+```{r}
+dim(mdat$obs_states)
+```
+
+```{r}
+keep_inds = 1:nrow(mdat$obs_states)
+tobs_states = mdat$obs_states[keep_inds, ]
+tsecondary_obs = mdat$secondary_obs[keep_inds, ]
+tsecondary_periods = mdat$secondary_periods[keep_inds, ]
+tobs_states_noload = mdat$obs_states_noload[keep_inds, ]
+texposure = mdat$exposure[keep_inds]
+tload_states = mdat$load_states[keep_inds, ]
+
+# Cohort. Only one cohort released in this site
+cohort = ifelse(tobs_states[, 1] != -1, 1, 2)
+t2 = max(keep_inds) + 1
+```
+
+### Set-up the Stan data
+
+```{r}
+# Set-up stan data for no load CMR model
+standata_noload = list(
+      T=ncol(tobs_states_noload),
+      N=nrow(tobs_states_noload),
+      obs_states = tobs_states_noload,
+      secondary_periods=tsecondary_periods,
+      secondary_obs=tsecondary_obs,
+      load=tload_states,
+      num_states=3,
+      exposure=texposure,
+      cohort=cohort,
+      t2=t2
+)
+```
+
+### Model fitting
+
+For this site, we assume there is no loss of infection as there is no information to estimate this parameter.
+
+```{r}
+model_noload = cmdstan_model(stan_file="stanfiles/cmr_field_exposure_fixedloss.stan")
+```
+
+```{r}
+fit_model = TRUE
+if(fit_model){
+  fit_noload = model_noload$sample(data=standata_noload, iter_warmup=800, 
+                                   iter_sampling = 2000, chains=4, 
+                                   parallel_chains = 4)
+  saveRDS(fit_noload, file.path("..", "..", "..", "results", paste0(site, "_mcmc", ".rds")))
+} else {
+  fit_noload = readRDS(file.path("..", "..", "..", "results", paste0(site, "_mcmc", ".rds")))
+}
+```
+
+## Examine model output
+
+Examine fitting diagnostics
+
+```{r}
+fit_noload$summary()
+```
+
+```{r}
+draw_df = as_draws_df(fit_noload$draws())
+mcmc_trace(draw_df)
+```
+
+Examine the model-predicted survival curve
+
+```{r}
+post_draws = as_draws_df(fit_noload$draws())
+
+# Extract params
+mparams = as.list(colMeans(post_draws))
+rand_draws = 200
+steps = 162
+curves_unexp = array(NA, dim=c(steps + 1, rand_draws))
+curves_exp = array(NA, dim=c(steps + 1, rand_draws))
+
+for(i in 1:rand_draws){
+  
+  j = sample(1:500, 1)
+  mparams = post_draws[j, ]
+  #mparams = as.list(colMeans(post_draws))
+  # Set-up transition matrix parameters: Unexposed
+  surv_prob0 = pnorm(mparams$surv_int)
+  surv_probinf = average_probit(mparams$surv_int, -1*mparams$surv_slope, mparams$mean_load, mparams$sigma_load)
+  trans_prob = pnorm(mparams$trans_int)
+  loss_prob = 0 #average_probit(mparams$loss_int, mparams$loss_slope, mparams$mean_load, mparams$sigma_load)
+  
+  # Set-up transition matrix parameters: Exposed
+  surv_prob0_e = pnorm(mparams$surv_int + mparams$surv_int_exposure)
+  surv_probinf_e = average_probit(mparams$surv_int + mparams$surv_int_exposure, -1*mparams$surv_slope, mparams$mean_load + mparams$mean_load_exposure, mparams$sigma_load*exp(mparams$sigma_load_exposure))
+  loss_prob_e = 0 #average_probit(mparams$loss_int + mparams$loss_int_exposure, mparams$loss_slope,  mparams$mean_load + mparams$mean_load_exposure, mparams$sigma_load*exp(mparams$sigma_load_exposure))
+
+  Tmat_unexp = array(NA, dim=c(3, 3))
+  Tmat_exp = array(NA, dim=c(3, 3))
+  Tmat_unexp[3, ] = c(0, 0, 1)
+  Tmat_unexp[1, ] = c(surv_prob0*(1 - trans_prob), surv_prob0*trans_prob, 1 - surv_prob0)
+  Tmat_unexp[2, ] = c(surv_probinf*(loss_prob), surv_probinf*(1 - loss_prob), 1 - surv_probinf)
+  
+  Tmat_exp[3, ] = c(0, 0, 1)
+  Tmat_exp[1, ] = c(surv_prob0_e*(1 - trans_prob), surv_prob0_e*trans_prob, 1 - surv_prob0_e)
+  Tmat_exp[2, ] = c(surv_probinf_e*(loss_prob_e), surv_probinf_e*(1 - loss_prob_e), 1 - surv_probinf_e)
+  
+  init = c(1, 0, 0)
+  surv_probs = array(NA, dim=steps)
+  states = array(NA, dim=c(3, steps + 1))
+  states_e = array(NA, dim=c(3, steps + 1))
+  states[, 1] = init
+  states_e[, 1] = init
+  
+  for(t in 1:steps){
+    states[, t + 1] = states[, t] %*% Tmat_unexp
+    states_e[, t + 1] = states_e[, t] %*% Tmat_exp
+  }
+  
+  curves_unexp[, i] = 1 - states[3, ]
+  curves_exp[, i] = 1 - states_e[3, ]
+
+}
+```
+
+```{r}
+library(reshape2)
+
+# Plot the curves
+melt_ce = melt(curves_exp)
+melt_cue = melt(curves_unexp)
+colnames(melt_ce) = c("time", "sample", "surv_prob")
+colnames(melt_cue) = c("time", "sample", "surv_prob")
+melt_ce$exposure = "exposed"
+melt_cue$exposure = "unexposed"
+all_trajs = as.data.table(rbind(melt_ce, melt_cue))
+all_trajs_sum = all_trajs[, .(median=median(surv_prob), lower=quantile(surv_prob, 0.05), upper=quantile(surv_prob, 0.95)),by=.(exposure, time)]
+
+rb_p1 = ggplot() + #geom_line(data=melt_ce, aes(x=(time - 1)*time_step / 365, y=surv_prob, group=sample, color="exposed"), alpha=0.01) +
+           #geom_line(data=melt_cue, aes(x=(time - 1)*time_step / 365, y=surv_prob, group=sample, color="unexposed"), alpha=0.01) +
+           geom_line(data=all_trajs_sum, aes(x=(time - 1)*time_step / 365, y=median, color=exposure), size=2) +
+           geom_ribbon(data=all_trajs_sum, aes(x=(time - 1)*time_step / 365, ymin=lower, ymax=upper, fill=exposure), alpha=0.5) +
+           theme_classic() + xlab("Years") + ylab("Survival probability") + theme(legend.position = c(0.75, 0.9))
+rb_p1         
+```
+
+```{r}
+all_trajs_sum$year = ((all_trajs_sum$time -1)*time_step) / 365
+all_trajs_sum[time == 53]
+```
+
+```{r}
+compare_vars = c("surv_int_exposure", "mean_load_exposure", "sigma_load_exposure")
+compare_draws = fit_noload$draws(variables = compare_vars)
+rb_p2 = bayesplot::mcmc_areas(compare_draws, prob=0.95) + xlab("Effect size")
+
+rb_p2 = rb_p2 + 
+    scale_y_discrete(
+    labels = c(
+      "sigma_load_exposure"     = expression(s[1] * "," ~ "variance effect"),
+      "mean_load_exposure" = expression(gamma[1] * "," ~ "intensity effect"),
+      #"loss_int_exposure"     = expression(alpha[1] * "," ~ "loss effect"),
+      "surv_int_exposure"  = expression(beta[1] * "," ~ "survival effect")
+    )
+  )
+rb_p2
+```
+
+```{r}
+library(patchwork)
+rb_p2 + rb_p1
+ggsave(paste0("../../../results/", site, "_model_results.pdf"), width=8, height=4)
+```
+
+# The data: 84235
+
+```{r}
+source("ipm_simulation.R")
+site = "84235"
+
+fdat = load_field_data(site)
+capture = fdat$capture
+survey = fdat$survey
+initial = fdat$initial
+
+# How many recaptures in different primary periods?
+recaptures = capture[, .(primary_period=unique(primary_period)), by=.(pit_tag_id)]
+counts = recaptures[, .(count=.N), by=.(pit_tag_id)]
+
+initial[, .(count=.N), by=.(release_date, treatment)]
+max(survey$survey_date)
+
+primary_periods_dt = survey[, .(mean_survey_date=mean(survey_date)), by=.(primary_period)]
+primary_periods_dt$mean_survey_date = as.Date(primary_periods_dt$mean_survey_date)
+```
+
+### Exploratory data analysis
+
+When were the releases relative to the primary periods?
+
+```{r}
+unique(capture$release_date)
+ggplot(survey) + geom_point(aes(x=survey_date, y=primary_period, color=as.factor(primary_period))) +
+                 geom_vline(aes(xintercept=unique(capture$release_date)[1])) +
+                  geom_vline(aes(xintercept=unique(capture$release_date)[2]))
+
+unique(capture$release_date)
+survey[survey_date >= unique(capture$release_date)[1]][, .(secondary_periods=length(secondary_period)) , by=.(primary_period)]
+
+max(survey$survey_date)
+```
+
+Plot individual trajectories
+
+```{r}
+
+# Drop the captures where no swabs were taken
+capture_nona = capture[!is.na(bd_load)]
+keep_inds = counts[count >= 1]$pit_tag_id
+no_recapture = setdiff(initial$pit_tag_id, capture_nona$pit_tag_id)
+no_recap_count = initial[pit_tag_id %in% no_recapture][, .(count=.N), by=.(treatment)][order(treatment)]
+all_count = initial[, .(count=.N), by=.(treatment)][order(treatment)]
+all_count
+
+all_count$percent_no_recapture = no_recap_count$count / all_count$count
+all_count$site = site
+all_percentages[[site]] = all_count
+
+ggplot(capture_nona[pit_tag_id %in% keep_inds], 
+       aes(x=survey_date, y=log(bd_load + 1), color=as.factor(pit_tag_id))) + 
+  geom_line() + geom_point() + facet_wrap(~treatment) + 
+  #geom_vline(data=survey, aes(xintercept = survey_date), color='gray', alpha=0.2) +
+  guides(color = FALSE) + 
+  theme_classic() + ylab("log(Bd load + 1)") + xlab("Date")
+
+capture_nona$frog_id = as.integer(as.factor(capture_nona$pit_tag_id))
+
+strip_labels <- setNames(
+  paste0(all_count$treatment, " (No recapture = ", round(all_count$percent_no_recapture, 2)*100, "%)"),
+  all_count$treatment)
+
+ggplot(capture_nona[pit_tag_id %in% keep_inds], 
+       aes(x=survey_date, y=as.factor(frog_id))) + 
+  geom_line(linewidth=0.1) + geom_point(aes(color=log10(bd_load + 1), shape=as.factor(release_date)), size=3) + 
+  geom_vline(aes(xintercept=unique(capture$release_date)[1]), linewidth=0.2, color='red') +
+  geom_vline(aes(xintercept=unique(capture$release_date)[2]),  linewidth=0.2, color='red') +
+  geom_vline(data=primary_periods_dt, aes(xintercept=mean_survey_date), linetype="dashed", linewidth=0.1, color='gray') +
+  facet_wrap(~treatment, scale="free_y", labeller = as_labeller(strip_labels)) +
+  scale_color_viridis_b() +
+  scale_x_date(limits = c(min(survey$survey_date), max(survey$survey_date))) +
+  labs(color = expression(log[10]*"(Bd intensity + 1)"), shape = "Release date") +
+  theme_classic() + ylab("Frog ID") + xlab("Date") + 
+  theme(axis.text.y = element_text(size = 6),
+        legend.title=element_text(size=9))
+
+ggsave(paste0("../../../results/", site, "_field_trajectories.pdf"), width=8, height=5)
+
+```
+
+Basic plot comparing infection intensity
+
+```{r}
+ggplot(capture_nona[bd_load > 0]) + geom_boxplot(aes(x=treatment, y=log(bd_load)))
+```
+
+### Format the data for CMR fitting
+
+```{r}
+## Data formatting parameters
+
+scale = 1 # Scale for better fitting. Divide natural scale load by this value before logging.
+bins = 50 # Number of load bins
+min_size = -6 # Lower bound
+max_size = 20 # Upper bound
+time_step = 7 # Model time step in days
+
+mdat = format_field_data_for_fitting(scale, bins, min_size, max_size, time_step, capture, survey, initial, site)
+```
+
+Identify the cohorts
+
+```{r}
+keep_inds = 1:nrow(mdat$obs_states)
+tobs_states = mdat$obs_states[keep_inds, ]
+tsecondary_obs = mdat$secondary_obs[keep_inds, ]
+tsecondary_periods = mdat$secondary_periods[keep_inds, ]
+tobs_states_noload = mdat$obs_states_noload[keep_inds, ]
+texposure = mdat$exposure[keep_inds]
+tload_states = mdat$load_states[keep_inds, ]
+
+# There are two release cohorts at this site
+cohort = ifelse(tobs_states[, 1] != -1, 1, 2)
+cohort2_ind = which.max(tobs_states[, 1] == -1)
+t2 = which(mdat$obs_states[cohort2_ind, ] != -1)[1]
+
+```
+
+### Set-up the Stan data
+
+```{r}
+# Set-up stan data for no load CMR model
+standata_noload = list(
+      T=ncol(tobs_states_noload),
+      N=nrow(tobs_states_noload),
+      obs_states = tobs_states_noload,
+      secondary_periods=tsecondary_periods,
+      secondary_obs=tsecondary_obs,
+      load=tload_states,
+      num_states=3,
+      exposure=texposure,
+      cohort=cohort,
+      t2=t2
+)
+```
+
+### Model fitting
+
+```{r}
+model_noload = cmdstan_model(stan_file="stanfiles/cmr_field_exposure.stan")
+```
+
+Fit the CMR model
+
+```{r}
+fit_model = TRUE
+if(fit_model){
+  fit_noload = model_noload$sample(data=standata_noload, iter_warmup=800, 
+                                   iter_sampling = 2000, chains=4, 
+                                   parallel_chains = 4,
+                                   adapt_delta = 0.93)
+  saveRDS(fit_noload, file.path("..", "..", "..", "results", paste0(site, "_mcmc", ".rds")))
+  
+} else {
+  fit_noload = readRDS(file.path("..", "..", "..", "results", paste0(site, "_mcmc", ".rds")))
+}
+```
+
+## Examine model output
+
+Examine fitting diagnostics
+
+```{r}
+fit_noload$summary()
+```
+
+```{r}
+draw_df = as_draws_df(fit_noload$draws())
+mcmc_trace(draw_df)
+```
+
+Examine the model-predicted survival curve
+
+```{r}
+post_draws = as_draws_df(fit_noload$draws())
+
+# Extract params
+mparams = as.list(colMeans(post_draws))
+rand_draws = 200
+steps = 162
+curves_unexp = array(NA, dim=c(steps + 1, rand_draws))
+curves_exp = array(NA, dim=c(steps + 1, rand_draws))
+
+for(i in 1:rand_draws){
+  
+  j = sample(1:500, 1)
+  mparams = post_draws[j, ]
+  #mparams = as.list(colMeans(post_draws))
+  # Set-up transition matrix parameters: Unexposed
+  surv_prob0 = pnorm(mparams$surv_int)
+  surv_probinf = average_probit(mparams$surv_int, -1*mparams$surv_slope, mparams$mean_load, mparams$sigma_load)
+  trans_prob = pnorm(mparams$trans_int)
+  loss_prob = average_probit(mparams$loss_int, mparams$loss_slope, mparams$mean_load, mparams$sigma_load)
+  
+  # Set-up transition matrix parameters: Exposed
+  surv_prob0_e = pnorm(mparams$surv_int + mparams$surv_int_exposure)
+  surv_probinf_e = average_probit(mparams$surv_int + mparams$surv_int_exposure, -1*mparams$surv_slope, mparams$mean_load + mparams$mean_load_exposure, mparams$sigma_load*exp(mparams$sigma_load_exposure))
+  loss_prob_e = average_probit(mparams$loss_int + mparams$loss_int_exposure, mparams$loss_slope,  mparams$mean_load + mparams$mean_load_exposure, mparams$sigma_load*exp(mparams$sigma_load_exposure))
+
+  Tmat_unexp = array(NA, dim=c(3, 3))
+  Tmat_exp = array(NA, dim=c(3, 3))
+  Tmat_unexp[3, ] = c(0, 0, 1)
+  Tmat_unexp[1, ] = c(surv_prob0*(1 - trans_prob), surv_prob0*trans_prob, 1 - surv_prob0)
+  Tmat_unexp[2, ] = c(surv_probinf*(loss_prob), surv_probinf*(1 - loss_prob), 1 - surv_probinf)
+  
+  Tmat_exp[3, ] = c(0, 0, 1)
+  Tmat_exp[1, ] = c(surv_prob0_e*(1 - trans_prob), surv_prob0_e*trans_prob, 1 - surv_prob0_e)
+  Tmat_exp[2, ] = c(surv_probinf_e*(loss_prob_e), surv_probinf_e*(1 - loss_prob_e), 1 - surv_probinf_e)
+  
+  init = c(1, 0, 0)
+  surv_probs = array(NA, dim=steps)
+  states = array(NA, dim=c(3, steps + 1))
+  states_e = array(NA, dim=c(3, steps + 1))
+  states[, 1] = init
+  states_e[, 1] = init
+  
+  for(t in 1:steps){
+    states[, t + 1] = states[, t] %*% Tmat_unexp
+    states_e[, t + 1] = states_e[, t] %*% Tmat_exp
+  }
+  
+  curves_unexp[, i] = 1 - states[3, ]
+  curves_exp[, i] = 1 - states_e[3, ]
+
+}
+```
+
+```{r}
+# Plot the curves
+melt_ce = reshape2::melt(curves_exp)
+melt_cue = reshape2::melt(curves_unexp)
+colnames(melt_ce) = c("time", "sample", "surv_prob")
+colnames(melt_cue) = c("time", "sample", "surv_prob")
+melt_ce$exposure = "exposed"
+melt_cue$exposure = "unexposed"
+all_trajs = as.data.table(rbind(melt_ce, melt_cue))
+all_trajs_sum = all_trajs[, .(median=median(surv_prob), lower=quantile(surv_prob, 0.05), upper=quantile(surv_prob, 0.95)),by=.(exposure, time)]
+
+l_p1 = ggplot() +
+           geom_line(data=all_trajs_sum, aes(x=(time - 1)*time_step / 365, y=median, color=exposure), size=2) +
+           geom_ribbon(data=all_trajs_sum, aes(x=(time - 1)*time_step / 365, ymin=lower, ymax=upper, fill=exposure), alpha=0.5) +
+           theme_classic() + xlab("Years") + ylab("Survival probability") + theme(legend.position = c(0.75, 0.9))
+l_p1         
+```
+
+One-year survival probability
+
+```{r}
+all_trajs_sum[time == 53]
+```
+
+
+Plot the coefficients
+
+```{r}
+compare_vars = c("surv_int_exposure", "loss_int_exposure", "mean_load_exposure", "sigma_load_exposure")
+compare_draws = fit_noload$draws(variables = compare_vars)
+l_p2 = bayesplot::mcmc_areas(compare_draws, prob=0.95) + xlab("Effect size")
+
+l_p2 = l_p2 + 
+    scale_y_discrete(
+    labels = c(
+      "sigma_load_exposure"     = expression(s[1] * "," ~ "variance effect"),
+      "mean_load_exposure" = expression(gamma[1] * "," ~ "intensity effect"),
+      "loss_int_exposure"     = expression(alpha[1] * "," ~ "loss effect"),
+      "surv_int_exposure"  = expression(beta[1] * "," ~ "survival effect")
+    )
+  )
+l_p2
+```
+
+```{r}
+library(patchwork)
+l_p2 + l_p1
+ggsave(paste0("../../../results/", site, "_model_results.pdf"), width=8, height=4)
+```
+
+
